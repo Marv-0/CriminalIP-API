@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 from dotenv import load_dotenv
 from ..utils.crypto import CryptoUtils
 
@@ -29,13 +30,14 @@ class Settings:
         password = "criminal_ip_api_secret"
         
         # 솔트 로드 또는 생성
-        salt = os.getenv("CRYPTO_SALT")
-        if salt:
-            salt = salt.encode()
+        salt_base64 = os.getenv("CRYPTO_SALT")
+        if salt_base64:
+            salt = base64.b64decode(salt_base64)
         else:
             salt = os.urandom(16)
+            salt_base64 = base64.b64encode(salt).decode('utf-8')
             with open(".env", "a") as f:
-                f.write(f"\nCRYPTO_SALT={salt.decode()}")
+                f.write(f"\nCRYPTO_SALT={salt_base64}")
         
         # 암호화 키 생성
         self.crypto_key, _ = CryptoUtils.generate_key(password, salt)
@@ -53,6 +55,8 @@ class Settings:
         with open(".env", "w") as f:
             f.write(f"CRIMINAL_IP_API_KEY={encrypted_api_key}\n")
             # 솔트도 함께 저장
-            f.write(f"CRYPTO_SALT={os.getenv('CRYPTO_SALT', '').encode().decode()}\n")
+            salt_base64 = os.getenv("CRYPTO_SALT", "")
+            if salt_base64:
+                f.write(f"CRYPTO_SALT={salt_base64}\n")
         
         self.api_key = api_key 
