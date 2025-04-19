@@ -690,7 +690,7 @@ class MainWindow(QMainWindow):
         try:
             self.settings.save_api_key(api_key)
             self.api = CriminalIPAPI(api_key)
-            QMessageBox.information(self, "성공", "API 키가 저장되었습니다.")
+            QMessageBox.information(self, "성공", "API 키가 환경변수에 저장되었습니다.")
             # API 키 저장 후 기본 페이지로 이동
             self.content_stack.setCurrentIndex(2)
         except Exception as e:
