@@ -2,14 +2,18 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QMessageBox,
                              QStackedWidget, QFrame, QTextEdit, QGroupBox,
                              QTableWidget, QTableWidgetItem, QHeaderView,
-                             QDialog, QDialogButtonBox, QProgressBar, QFileDialog)
-from PySide6.QtCore import Qt, QThread, Signal
+                             QDialog, QDialogButtonBox, QProgressBar, QFileDialog,
+                             QApplication)
+from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtGui import QAction, QIcon, QFont
 
 from ..config.settings import Settings
 from ..api.criminal_ip import CriminalIPAPI
 import csv
 import os
+import multiprocessing
+from functools import partial
+import atexit
 
 class IPSearchWorker(QThread):
     """IP 검색을 위한 작업자 스레드"""
@@ -18,25 +22,81 @@ class IPSearchWorker(QThread):
     error = Signal(str, str)  # IP, 에러 메시지
     finished = Signal()
     
-    def __init__(self, api, ip_list):
+    def __init__(self, api_key, ip_list):
         super().__init__()
-        self.api = api
+        self.api_key = api_key
         self.ip_list = ip_list
+        self.process_count = min(multiprocessing.cpu_count(), len(ip_list))
+        self._is_running = True
+    
+    @staticmethod
+    def process_ip(args):
+        """단일 IP 처리 함수 (정적 메서드)"""
+        ip, api_key = args
+        try:
+            # API 객체 생성
+            api = CriminalIPAPI(api_key)
+            # IP 상세 정보 조회
+            summary_result = api.ip_summary(ip)
+            return ip, summary_result, None
+        except Exception as e:
+            return ip, None, str(e)
     
     def run(self):
         total = len(self.ip_list)
-        for i, ip in enumerate(self.ip_list, 1):
-            try:
-                # IP 상세 정보 조회
-                summary_result = self.api.ip_summary(ip)
-                self.result.emit(ip, summary_result)
-            except Exception as e:
-                self.error.emit(ip, str(e))
-            
-            # 진행 상황 업데이트
-            self.progress.emit(i, total)
+        processed = 0
+        
+        # API 키와 IP 쌍으로 인자 생성
+        args = [(ip, self.api_key) for ip in self.ip_list]
+        
+        # 멀티프로세싱 풀 생성
+        with multiprocessing.Pool(processes=self.process_count) as pool:
+            # 비동기 작업 시작
+            for ip, data, error in pool.imap_unordered(self.process_ip, args):
+                if not self._is_running:
+                    break
+                    
+                processed += 1
+                
+                if error:
+                    self.error.emit(ip, error)
+                else:
+                    self.result.emit(ip, data)
+                
+                # 진행 상황 업데이트
+                self.progress.emit(processed, total)
         
         self.finished.emit()
+    
+    def stop(self):
+        """스레드 중지"""
+        self._is_running = False
+
+# 전역 스레드 관리자
+class ThreadManager(QObject):
+    def __init__(self):
+        super().__init__()
+        self.threads = []
+    
+    def add_thread(self, thread):
+        self.threads.append(thread)
+    
+    def cleanup(self):
+        for thread in self.threads:
+            if thread and thread.isRunning():
+                thread.stop()
+                thread.wait()
+        self.threads.clear()
+
+# 전역 스레드 관리자 인스턴스
+thread_manager = ThreadManager()
+
+# 애플리케이션 종료 시 스레드 정리
+def cleanup_threads():
+    thread_manager.cleanup()
+
+# 애플리케이션 종료 시 정리 함수 등록
+atexit.register(cleanup_threads)
 
 class IPDetailDialog(QDialog):
     def __init__(self, ip_data, parent=None):
@@ -172,7 +232,27 @@ class MainWindow(QMainWindow):
         self.result_table.setObjectName("result-table")
         self.result_table.setColumnCount(8)
         self.result_table.setHorizontalHeaderLabels(["IP 주소", "국가", "도시", "ISP", "열린 포트", "VPN", "모바일", "상세보기"])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        
+        # 열 너비 설정
+        self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)  # IP 주소
+        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)   # 국가
+        self.result_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch) # 도시
+        self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch) # ISP
+        self.result_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)   # 열린 포트
+        self.result_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Fixed)   # VPN
+        self.result_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Fixed)   # 모바일
+        self.result_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)   # 상세보기
+        
+        # 고정 열 너비 설정
+        self.result_table.setColumnWidth(1, 60)  # 국가
+        self.result_table.setColumnWidth(4, 80)  # 열린 포트
+        self.result_table.setColumnWidth(5, 60)  # VPN
+        self.result_table.setColumnWidth(6, 60)  # 모바일
+        self.result_table.setColumnWidth(7, 100) # 상세보기
+        
+        # 테이블 셀 클릭 이벤트 연결
+        self.result_table.cellClicked.connect(self.handle_cell_click)
+        
         layout.addWidget(self.result_table)
         
         return page
@@ -202,12 +282,22 @@ class MainWindow(QMainWindow):
         # 검색 버튼 비활성화
         self.search_button.setEnabled(False)
         
+        # 이전 작업자 스레드가 있으면 중지
+        if self.search_worker and self.search_worker.isRunning():
+            self.search_worker.stop()
+            # 스레드가 완전히 종료될 때까지 기다림
+            self.search_worker.wait()
+        
         # 작업자 스레드 생성 및 시작
-        self.search_worker = IPSearchWorker(self.api, ip_list)
+        self.search_worker = IPSearchWorker(self.api.api_key, ip_list)
         self.search_worker.progress.connect(self.update_progress)
         self.search_worker.result.connect(self.add_result)
         self.search_worker.error.connect(self.show_error)
         self.search_worker.finished.connect(self.search_finished)
+        
+        # 스레드 관리자에 추가
+        thread_manager.add_thread(self.search_worker)
+        
         self.search_worker.start()
     
     def update_progress(self, current, total):
@@ -220,44 +310,64 @@ class MainWindow(QMainWindow):
         self.result_table.insertRow(row)
         
         # 기본 정보 추가
-        self.result_table.setItem(row, 0, QTableWidgetItem(ip))
+        ip_item = QTableWidgetItem(ip)
+        ip_item.setTextAlignment(Qt.AlignCenter)
+        ip_item.setFlags(ip_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
+        self.result_table.setItem(row, 0, ip_item)
         
         # whois 데이터 가져오기
         whois_data = data.get('whois', {}).get('data', [{}])[0] if data.get('whois', {}).get('data') else {}
         
         # 국가 정보
         country = whois_data.get('org_country_code', 'N/A')
-        self.result_table.setItem(row, 1, QTableWidgetItem(country.upper()))
+        country_item = QTableWidgetItem(country.upper())
+        country_item.setTextAlignment(Qt.AlignCenter)
+        country_item.setFlags(country_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
+        self.result_table.setItem(row, 1, country_item)
         
         # 도시 정보
         city = whois_data.get('city', 'N/A')
-        self.result_table.setItem(row, 2, QTableWidgetItem(city))
+        city_item = QTableWidgetItem(city)
+        city_item.setTextAlignment(Qt.AlignCenter)
+        city_item.setFlags(city_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
+        self.result_table.setItem(row, 2, city_item)
         
         # ISP 정보
         isp = whois_data.get('org_name', 'N/A')
-        self.result_table.setItem(row, 3, QTableWidgetItem(isp))
+        isp_item = QTableWidgetItem(isp)
+        isp_item.setTextAlignment(Qt.AlignCenter)
+        isp_item.setFlags(isp_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
+        self.result_table.setItem(row, 3, isp_item)
         
         # 열린 포트 수
         open_ports = data.get('port', {}).get('count', 0)
-        self.result_table.setItem(row, 4, QTableWidgetItem(str(open_ports)))
+        ports_item = QTableWidgetItem(str(open_ports))
+        ports_item.setTextAlignment(Qt.AlignCenter)
+        ports_item.setFlags(ports_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
+        self.result_table.setItem(row, 4, ports_item)
         
         # VPN 여부
         is_vpn = data.get('issues', {}).get('is_vpn', False)
         vpn_item = QTableWidgetItem("예" if is_vpn else "아니오")
         vpn_item.setForeground(Qt.red if is_vpn else Qt.green)
+        vpn_item.setTextAlignment(Qt.AlignCenter)
+        vpn_item.setFlags(vpn_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
         self.result_table.setItem(row, 5, vpn_item)
         
         # 모바일 여부
         is_mobile = data.get('issues', {}).get('is_mobile', False)
         mobile_item = QTableWidgetItem("예" if is_mobile else "아니오")
         mobile_item.setForeground(Qt.red if is_mobile else Qt.green)
+        mobile_item.setTextAlignment(Qt.AlignCenter)
+        mobile_item.setFlags(mobile_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
         self.result_table.setItem(row, 6, mobile_item)
         
-        # 상세보기 버튼 추가
-        detail_btn = QPushButton("상세보기")
-        detail_btn.setObjectName("detail-button")
-        detail_btn.clicked.connect(lambda checked, data=data: self.show_ip_detail(data))
-        self.result_table.setCellWidget(row, 7, detail_btn)
+        # 상세보기 텍스트 추가 (링크 대신 일반 텍스트로 변경)
+        detail_item = QTableWidgetItem("상세보기")
+        detail_item.setTextAlignment(Qt.AlignCenter)
+        detail_item.setFlags(detail_item.flags() & ~Qt.ItemIsEditable)  # 읽기 전용으로 설정
+        detail_item.setForeground(Qt.blue)  # 파란색으로 표시
+        self.result_table.setItem(row, 7, detail_item)
         
         # 결과가 있으면 내보내기 버튼 활성화
         self.export_button.setEnabled(True)
@@ -521,6 +631,7 @@ class MainWindow(QMainWindow):
             
             #result-table::item {
                 padding: 8px;
+                text-align: center;
             }
             
             #result-table QHeaderView::section {
@@ -529,19 +640,20 @@ class MainWindow(QMainWindow):
                 padding: 8px;
                 border: none;
                 font-weight: bold;
+                text-align: center;
             }
             
-            #detail-button {
-                background-color: #404040;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 12px;
+            #detail-link {
+                color: #4a9eff;
                 font-size: 12px;
+                padding: 0px;
+                margin: 0px;
+                line-height: 30px;
             }
             
-            #detail-button:hover {
-                background-color: #505050;
+            #detail-link:hover {
+                color: #6ab0ff;
+                text-decoration: underline;
             }
             
             #detail-text {
@@ -626,3 +738,30 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "오류", f"CSV 파일 저장 중 오류가 발생했습니다: {str(e)}")
+    
+    def closeEvent(self, event):
+        """창 닫기 이벤트 처리"""
+        # 실행 중인 스레드가 있으면 중지
+        if self.search_worker and self.search_worker.isRunning():
+            self.search_worker.stop()
+            # 스레드가 완전히 종료될 때까지 기다림
+            self.search_worker.wait()
+            # 스레드 객체 참조 제거
+            self.search_worker = None
+        
+        # 이벤트 처리
+        event.accept()
+
+    def handle_cell_click(self, row, column):
+        """테이블 셀 클릭 이벤트 처리"""
+        # 상세보기 열(7번 열)을 클릭했을 때만 처리
+        if column == 7:
+            # 해당 행의 IP 주소 가져오기
+            ip = self.result_table.item(row, 0).text()
+            
+            # IP 상세 정보 조회
+            try:
+                data = self.api.ip_summary(ip)
+                self.show_ip_detail(data)
+            except Exception as e:
+                QMessageBox.critical(self, "오류", f"IP {ip} 상세 정보 조회 중 오류가 발생했습니다: {str(e)}")
