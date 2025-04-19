@@ -1,0 +1,5 @@
+# created by virtualenv automatically
+*.pyc
+venv/
+.env
+__pycache__/
